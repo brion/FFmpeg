@@ -58,6 +58,9 @@ typedef struct SvtContext {
     int level;
 
     int base_layer_switch_mode;
+
+    int tile_columns;
+    int tile_rows;
 } SvtContext;
 
 static int error_mapping(EbErrorType svt_ret)
@@ -199,6 +202,13 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
 
     if (ten_bits) {
         param->encoder_bit_depth        = 10;
+    }
+
+    param->tile_columns = svt_enc->tile_columns;
+    param->tile_rows = svt_enc->tile_rows;
+
+    if (avctx->thread_count > 0) {
+        param->logical_processors = avctx->thread_count;
     }
 
     ret = alloc_buffer(param, svt_enc);
@@ -429,9 +439,10 @@ static const AVOption options[] = {
 #undef LEVEL
 
     { "rc", "Bit rate control mode", OFFSET(rc_mode),
-      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, VE , "rc"},
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, VE , "rc"},
         { "cqp", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 },  INT_MIN, INT_MAX, VE, "rc" },
-        { "vbr", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 },  INT_MIN, INT_MAX, VE, "rc" },
+        { "abr", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 },  INT_MIN, INT_MAX, VE, "rc" },
+        { "vbr", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 2 },  INT_MIN, INT_MAX, VE, "rc" },
 
     { "qp", "QP value for intra frames", OFFSET(qp),
       AV_OPT_TYPE_INT, { .i64 = 50 }, 0, 63, VE },
@@ -445,6 +456,12 @@ static const AVOption options[] = {
     { "forced-idr", "If forcing keyframes, force them as IDR frames.", OFFSET(forced_idr),
       AV_OPT_TYPE_BOOL,   { .i64 = 0 }, -1, 1, VE },
 
+    { "tile-columns", "log2 of tile columns", OFFSET(tile_columns),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 6, VE },
+
+    { "tile-rows", "log2 of tile rows", OFFSET(tile_rows),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 6, VE },
+
     {NULL},
 };
 
@@ -456,11 +473,11 @@ static const AVClass class = {
 };
 
 static const AVCodecDefault eb_enc_defaults[] = {
-    { "b",         "7M"    },
-    { "g",         "-2"    },
-    { "flags",     "-cgop" },
-    { "qmin",      "0"    },
-    { "qmax",      "63"    },
+    { "b",            "7M"    },
+    { "g",            "-2"    },
+    { "flags",        "-cgop" },
+    { "qmin",         "0"     },
+    { "qmax",         "63"    },
     { NULL },
 };
 
