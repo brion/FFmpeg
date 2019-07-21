@@ -31,6 +31,27 @@
 #include "internal.h"
 #include "avcodec.h"
 
+#define TD_SIZE                     2
+#define OBU_FRAME_HEADER_SIZE       3
+#define TILES_GROUP_SIZE            1
+
+typedef struct SvtPacket {
+    uint8_t            *buf;
+    size_t              size;
+    int64_t             pts;
+    int64_t             dts;
+    int                 flags;
+    int                 eos;
+    struct SvtPacket   *next;
+} SvtPacket;
+
+typedef struct SvtRingBuf {
+    int64_t *data;
+    size_t   size;
+    size_t   start;
+    size_t   end;
+} SvtRingBuf;
+
 typedef struct SvtContext {
     AVClass     *class;
 
@@ -39,6 +60,12 @@ typedef struct SvtContext {
 
     EbBufferHeaderType         *in_buf;
     int                         raw_size;
+
+    SvtRingBuf                  stored_dts;
+    SvtRingBuf                  stored_pts;
+    SvtPacket                  *packet_head;
+    SvtPacket                  *packet_tail;
+    SvtPacket                  *packet_work;
 
     int         eos_flag;
 
@@ -143,6 +170,60 @@ failed:
     return AVERROR(ENOMEM);
 }
 
+static void ringbuf_alloc(SvtRingBuf *buf, size_t size)
+{
+    buf->size = size;
+    buf->data = av_malloc(buf->size * sizeof(int64_t));
+    buf->start = 0;
+    buf->end = 0;
+}
+
+static void ringbuf_free(SvtRingBuf *buf)
+{
+    av_freep(&buf->data);
+    buf->size = 0;
+    buf->start = 0;
+    buf->end = 0;
+}
+
+static int64_t ringbuf_dequeue(SvtRingBuf *buf)
+{
+    if (buf->start == buf->end) {
+        // This shouldn't happen.
+        printf("!!ringbuf_dequeue early, should not happen...?\n");
+        return 0;
+    } else {
+        int64_t val = buf->data[buf->start];
+        buf->start = (buf->start + 1) % buf->size;
+        return val;
+    }
+}
+
+static void ringbuf_copy(SvtRingBuf *dest, SvtRingBuf *src);
+
+static void ringbuf_enqueue(SvtRingBuf *buf, int64_t val)
+{
+    size_t next = (buf->end + 1) % buf->size;
+    if (next == buf->start) {
+        // We wrapped around. Allocate bigger space.
+        SvtRingBuf new_buf;
+        ringbuf_alloc(&new_buf, buf->size * 2);
+        ringbuf_copy(&new_buf, buf);
+        ringbuf_free(buf);
+        *buf = new_buf;
+        next = (buf->end + 1) % buf->size;
+    }
+    buf->data[buf->end] = val;
+    buf->end = next;
+}
+
+static void ringbuf_copy(SvtRingBuf *dest, SvtRingBuf *src)
+{
+    while (src->start != src->end) {
+        ringbuf_enqueue(dest, ringbuf_dequeue(src));
+    }
+}
+
 static int config_enc_params(EbSvtAv1EncConfiguration *param,
                              AVCodecContext *avctx)
 {
@@ -213,6 +294,12 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
 
     ret = alloc_buffer(param, svt_enc);
 
+    ringbuf_alloc(&svt_enc->stored_dts, 16);
+    ringbuf_alloc(&svt_enc->stored_pts, 16);
+    svt_enc->packet_head = NULL;
+    svt_enc->packet_tail = NULL;
+    svt_enc->packet_work = av_mallocz(sizeof(SvtPacket));
+
     return ret;
 }
 
@@ -269,7 +356,7 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
         goto failed_init_handle;
     }
 
-    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+    if (1 /* avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER */) {
         EbBufferHeaderType *headerPtr = NULL;
 
         svt_ret = eb_svt_enc_stream_header(svt_enc->svt_handle, &headerPtr);
@@ -332,6 +419,8 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     headerPtr->flags       = 0;
     headerPtr->p_app_private  = NULL;
     headerPtr->pts          = frame->pts;
+    ringbuf_enqueue(&svt_enc->stored_dts, frame->pts);
+    ringbuf_enqueue(&svt_enc->stored_pts, frame->pts);
     switch (frame->pict_type) {
     case AV_PICTURE_TYPE_I:
         headerPtr->pic_type = svt_enc->forced_idr > 0 ? EB_AV1_KEY_PICTURE : EB_AV1_INTRA_ONLY_PICTURE;
@@ -351,33 +440,203 @@ static int eb_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     return 0;
 }
 
-static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
+static void config_packet(AVCodecContext *avctx, EbBufferHeaderType *headerPtr)
+{
+    SvtContext  *svt_enc = avctx->priv_data;
+    SvtPacket   *packet  = svt_enc->packet_work;
+
+    //packet->dts = headerPtr->dts;
+    //packet->pts = headerPtr->pts;
+    packet->flags = 0;
+    if (headerPtr->pic_type == EB_AV1_KEY_PICTURE)
+        packet->flags |= AV_PKT_FLAG_KEY;
+    if (headerPtr->pic_type == EB_AV1_NON_REF_PICTURE)
+        packet->flags |= AV_PKT_FLAG_DISPOSABLE;
+
+    packet->eos = (headerPtr->flags & EB_BUFFERFLAG_EOS) ? 1 : 0;
+}
+
+static void append_to_packet(AVCodecContext *avctx, uint8_t *src, size_t len)
+{
+    SvtContext  *svt_enc = avctx->priv_data;
+    SvtPacket   *packet  = svt_enc->packet_work;
+
+    if (packet->size > 0) {
+        packet->buf = av_realloc(packet->buf, packet->size + len);
+    } else {
+        packet->buf = av_malloc(len);
+    }
+    memcpy(packet->buf + packet->size, src, len);
+    packet->size += len;
+}
+
+static void enqueue_packet(AVCodecContext *avctx)
+{
+    SvtContext  *svt_enc = avctx->priv_data;
+    SvtPacket   *packet  = svt_enc->packet_work;
+
+    packet->dts = ringbuf_dequeue(&svt_enc->stored_dts);
+    packet->pts = ringbuf_dequeue(&svt_enc->stored_pts);
+
+    // Skip 0-size initial blob
+    if (packet->size > 0) {
+        if (svt_enc->packet_tail) {
+            svt_enc->packet_tail->next = packet;
+        } else {
+            svt_enc->packet_head = packet;
+        }
+        svt_enc->packet_tail = packet;
+
+        svt_enc->packet_work = av_mallocz(sizeof(SvtPacket));
+    }
+}
+
+static SvtPacket *dequeue_packet(AVCodecContext *avctx)
+{
+    SvtContext  *svt_enc = avctx->priv_data;
+    SvtPacket   *packet = svt_enc->packet_head;
+    svt_enc->packet_head = packet->next;
+    if (svt_enc->packet_head == NULL) {
+        svt_enc->packet_tail = NULL;
+    }
+    packet->next = NULL;
+
+    static int packet_no = 0;
+    packet_no++;
+    printf("## packet %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
+        packet_no, (long unsigned)packet->size, packet->dts, packet->pts, packet->flags);
+    return packet;
+}
+
+static void free_packet(SvtPacket *packet)
+{
+    if (packet->next) {
+        free_packet(packet->next);
+    }
+    if (packet->size > 0) {
+        av_freep(&packet->buf);
+    }
+    av_freep(&packet);
+}
+
+static int run_next_packet(AVCodecContext *avctx)
 {
     SvtContext  *svt_enc = avctx->priv_data;
     EbBufferHeaderType   *headerPtr;
     EbErrorType          svt_ret;
+    int is_alt_ref = 1;
+
+    while (/*is_alt_ref || */ !svt_enc->packet_head) {
+        size_t split;
+        size_t split_len;
+
+        svt_ret = eb_svt_get_packet(svt_enc->svt_handle, &headerPtr, svt_enc->eos_flag);
+        if (svt_ret == EB_NoErrorEmptyQueue)
+            return AVERROR(EAGAIN);
+
+        is_alt_ref = (headerPtr->flags & EB_BUFFERFLAG_IS_ALT_REF);
+        EbBool   has_tiles = (EbBool)(svt_enc->tile_columns || svt_enc->tile_columns);
+        uint8_t  obu_frame_header_size = has_tiles ? OBU_FRAME_HEADER_SIZE + 1 : OBU_FRAME_HEADER_SIZE;
+
+        static int hdr_no = 0;
+        hdr_no++;
+        printf("## header %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
+            hdr_no, (long unsigned)headerPtr->n_filled_len, headerPtr->dts, headerPtr->pts, headerPtr->flags);
+
+        switch (headerPtr->flags & 0x00000006) { // Check for the flags EB_BUFFERFLAG_HAS_TD and EB_BUFFERFLAG_SHOW_EXT
+        case (EB_BUFFERFLAG_HAS_TD | EB_BUFFERFLAG_SHOW_EXT):
+
+            // terminate previous output packet
+            enqueue_packet(avctx);
+
+            // Write a new output packet as a TD is in the packet
+            split_len = (obu_frame_header_size + TD_SIZE);
+            split = headerPtr->n_filled_len - split_len;
+            config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer, split);
+
+            // An EB_BUFFERFLAG_SHOW_EXT means that another TD has been added to the packet to show another frame
+            enqueue_packet(avctx);
+            config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer + split, split_len);
+
+            break;
+
+        case (EB_BUFFERFLAG_HAS_TD):
+
+            // terminate previous packet
+            enqueue_packet(avctx);
+
+            // Write a new frame header to file as a TD is in the packet
+            config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer, headerPtr->n_filled_len);
+            break;
+
+        case (EB_BUFFERFLAG_SHOW_EXT):
+
+            // this case means that there's only one TD in this packet and is related
+            // this packet will be part of the previous output packet
+            split_len = (obu_frame_header_size + TD_SIZE);
+            split = headerPtr->n_filled_len - split_len;
+            //config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer, split);
+
+            // terminate previous output packet
+            enqueue_packet(avctx);
+
+            // An EB_BUFFERFLAG_SHOW_EXT means that another TD has been added to the packet to show another frame, a new packet is needed
+            config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer + split, split_len);
+            break;
+
+        default:
+
+            // This is a packet without a TD, write it into the output packet
+            //config_packet(avctx, headerPtr);
+            append_to_packet(avctx, headerPtr->p_buffer, headerPtr->n_filled_len);
+            break;
+        }
+
+        if (svt_enc->packet_work->eos) {
+            enqueue_packet(avctx);
+        }
+
+        eb_svt_release_out_buffer(&headerPtr);
+    }
+
+    return 0;
+}
+
+static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
+{
+    SvtContext *svt_enc = avctx->priv_data;
     int ret;
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, svt_enc->raw_size, 0)) < 0) {
+    if (!svt_enc->packet_head) {
+        ret = run_next_packet(avctx);
+        if (!svt_enc->packet_head) {
+            return AVERROR(EAGAIN);
+        }
+    }
+
+    SvtPacket *packet = dequeue_packet(avctx);
+
+    if ((ret = ff_alloc_packet2(avctx, pkt, packet->size, 0)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to allocate output packet.\n");
         return ret;
     }
-    svt_ret = eb_svt_get_packet(svt_enc->svt_handle, &headerPtr, svt_enc->eos_flag);
-    if (svt_ret == EB_NoErrorEmptyQueue)
-        return AVERROR(EAGAIN);
 
-    memcpy(pkt->data, headerPtr->p_buffer, headerPtr->n_filled_len);
-    pkt->size = headerPtr->n_filled_len;
-    pkt->pts  = headerPtr->pts;
-    pkt->dts  = headerPtr->dts;
-    if (headerPtr->pic_type == EB_AV1_KEY_PICTURE)
-        pkt->flags |= AV_PKT_FLAG_KEY;
-    if (headerPtr->pic_type == EB_AV1_NON_REF_PICTURE)
-        pkt->flags |= AV_PKT_FLAG_DISPOSABLE;
+    if (packet->size > 0) {
+        memcpy(pkt->data, packet->buf, packet->size);
+    }
+    pkt->size  = packet->size;
+    pkt->pts   = packet->pts;
+    pkt->dts   = packet->dts;
+    pkt->flags = packet->flags;
 
-    ret = (headerPtr->flags & EB_BUFFERFLAG_EOS) ? AVERROR_EOF : 0;
+    ret = (packet->eos) ? AVERROR_EOF : 0;
 
-    eb_svt_release_out_buffer(&headerPtr);
+    free_packet(packet);
 
     return ret;
 }
@@ -390,6 +649,14 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
     eb_deinit_handle(svt_enc->svt_handle);
 
     free_buffer(svt_enc);
+
+    ringbuf_free(&svt_enc->stored_dts);
+    ringbuf_free(&svt_enc->stored_pts);
+
+    if (svt_enc->packet_head)
+        free_packet(svt_enc->packet_head);
+    if (svt_enc->packet_work)
+        free_packet(svt_enc->packet_work);
 
     return 0;
 }
