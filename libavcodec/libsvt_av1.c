@@ -501,10 +501,10 @@ static SvtPacket *dequeue_packet(AVCodecContext *avctx)
     }
     packet->next = NULL;
 
-    static int packet_no = 0;
-    packet_no++;
-    printf("## packet %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
-        packet_no, (long unsigned)packet->size, packet->dts, packet->pts, packet->flags);
+    //static int packet_no = 0;
+    //packet_no++;
+    //printf("## packet %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
+    //    packet_no, (long unsigned)packet->size, packet->dts, packet->pts, packet->flags);
     return packet;
 }
 
@@ -538,10 +538,10 @@ static int run_next_packet(AVCodecContext *avctx)
         EbBool   has_tiles = (EbBool)(svt_enc->tile_columns || svt_enc->tile_columns);
         uint8_t  obu_frame_header_size = has_tiles ? OBU_FRAME_HEADER_SIZE + 1 : OBU_FRAME_HEADER_SIZE;
 
-        static int hdr_no = 0;
-        hdr_no++;
-        printf("## header %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
-            hdr_no, (long unsigned)headerPtr->n_filled_len, headerPtr->dts, headerPtr->pts, headerPtr->flags);
+        //static int hdr_no = 0;
+        //hdr_no++;
+        //printf("## header %d (%lu bytes, dts %lld, pts %lld, flags %d) ##\n",
+        //    hdr_no, (long unsigned)headerPtr->n_filled_len, headerPtr->dts, headerPtr->pts, headerPtr->flags);
 
         switch (headerPtr->flags & 0x00000006) { // Check for the flags EB_BUFFERFLAG_HAS_TD and EB_BUFFERFLAG_SHOW_EXT
         case (EB_BUFFERFLAG_HAS_TD | EB_BUFFERFLAG_SHOW_EXT):
