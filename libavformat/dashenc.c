@@ -385,6 +385,11 @@ static void set_codec_str(AVFormatContext *s, AVCodecParameters *par,
             av_strlcatf(str, size, ".%02x%02x%02x",
                         extradata[1], extradata[2], extradata[3]);
         av_free(tmpbuf);
+    } else if (!strcmp(str, "av01")) {
+        // @PATCH HACK HACK
+        // use real info here
+        // av01.0.09M.08
+        av_strlcatf(str, size, ".0.09M.08");
     }
 }
 
